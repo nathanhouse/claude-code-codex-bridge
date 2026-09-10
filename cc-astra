@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# HAL-ID: #HAL-20260910-2125-NH-6F
+# Description: Launch Claude Code on GPT-6 Astra via the ChatGPT subscription — supervises the bridge + claude.
+# Command: #HAL-20260910-2116-NH-SI  (read it FIRST — resolve: rg -l 'HAL-20260910-2116-NH-SI' ~/.claude/commands/)
+#
+# Usage:  cc-astra [claude args...]        e.g.  cc-astra -p "reply pong"
+# Env:    CCB_MODEL (default gpt-6-astra)  CCB_SMALL_MODEL (default = CCB_MODEL)  CCB_DEBUG=1  CODEX_HOME
+#         CCB_DRY_RUN=1 prints the environment claude would get and exits (used by selftest.sh)
+# Exit:   claude's exit code; 2 = prerequisites missing; 3 = bridge failed to start
+set -u
+
+DIR="$(cd "$(dirname "$(readlink "$0" 2>/dev/null || echo "$0")")" && pwd)"
+CCB_MODEL="${CCB_MODEL:-gpt-6-astra}"
+CCB_SMALL_MODEL="${CCB_SMALL_MODEL:-$CCB_MODEL}"
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+
+die() { printf 'cc-astra: %s\n' "$*" >&2; exit "${2:-2}"; }
+
+command -v bun >/dev/null 2>&1 || die "bun not found — install from https://bun.sh"
+command -v claude >/dev/null 2>&1 || die "claude not found — install Claude Code"
+[ -f "$CODEX_HOME/auth.json" ] || die "no Codex login at $CODEX_HOME/auth.json — run: codex login"
+
+# Per-session local token: only this claude process can use this bridge.
+TOKEN="$(LC_ALL=C tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 48)"
+[ -n "$TOKEN" ] || die "could not generate a session token"
+
+OUT="$(mktemp)"; ERR="$(mktemp)"
+BRIDGE_PID=""
+cleanup() {
+	[ -n "$BRIDGE_PID" ] && kill "$BRIDGE_PID" 2>/dev/null
+	rm -f "$OUT" "$ERR"
+}
+trap cleanup EXIT INT TERM
+
+CCB_LOCAL_TOKEN="$TOKEN" CCB_PARENT_PID="$$" CCB_PORT=0 CCB_HOST=127.0.0.1 \
+CCB_MODEL="$CCB_MODEL" CCB_SMALL_MODEL="$CCB_SMALL_MODEL" CODEX_HOME="$CODEX_HOME" \
+	bun run "$DIR/src/bridge.ts" >"$OUT" 2>"$ERR" &
+BRIDGE_PID=$!
+
+# Wait for the bridge to print its port (it binds a free one).
+PORT=""
+for _ in $(seq 1 50); do
+	PORT="$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' "$OUT" | head -n1)"
+	[ -n "$PORT" ] && break
+	kill -0 "$BRIDGE_PID" 2>/dev/null || break
+	sleep 0.1
+done
+if [ -z "$PORT" ]; then
+	cat "$ERR" >&2
+	die "bridge failed to start" 3
+fi
+# Surface bridge warnings (permissions, missing login) once, then keep stderr quiet.
+[ -s "$ERR" ] && cat "$ERR" >&2
+
+# Never let an outer session's Anthropic credentials or cloud flags leak into this one.
+unset ANTHROPIC_API_KEY CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX ANTHROPIC_CUSTOM_HEADERS
+unset CLAUDE_CODE_REMOTE CLAUDE_CODE_MESSAGING_SOCKET CLAUDE_CODE_SESSION_ID CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_ENTRYPOINT
+export API_TIMEOUT_MS="${API_TIMEOUT_MS:-600000}" # reasoning models can be slow; matches the bridge idle timeout
+
+export ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT"
+export ANTHROPIC_AUTH_TOKEN="$TOKEN"
+export ANTHROPIC_MODEL="$CCB_MODEL"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="$CCB_MODEL"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="$CCB_MODEL"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="$CCB_SMALL_MODEL"
+export CLAUDE_CODE_SUBAGENT_MODEL="$CCB_MODEL"
+export DISABLE_TELEMETRY=1
+
+printf 'cc-astra: bridge 127.0.0.1:%s → %s (ChatGPT subscription via Codex login)\n' "$PORT" "$CCB_MODEL" >&2
+
+if [ "${CCB_DRY_RUN:-0}" = "1" ]; then
+	env | grep -E '^(ANTHROPIC_|CLAUDE_CODE_SUBAGENT_MODEL|DISABLE_TELEMETRY)' | sed "s/$TOKEN/<token>/"
+	exit 0
+fi
+
+claude "$@"

@@ -1,0 +1,14 @@
+{
+  "name": "claude-code-codex-bridge",
+  "version": "0.1.0",
+  "description": "Run Claude Code on GPT-6 Astra via your ChatGPT subscription — a zero-dependency localhost bridge using the Codex CLI login.",
+  "license": "MIT",
+  "type": "module",
+  "private": false,
+  "scripts": {
+    "start": "bun run src/bridge.ts",
+    "test": "bun test",
+    "check": "bunx @biomejs/biome check --write src test"
+  },
+  "engines": { "bun": ">=1.2" }
+}

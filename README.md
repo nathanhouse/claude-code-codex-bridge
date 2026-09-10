@@ -1,17 +1,94 @@
 # claude-code-codex-bridge
 
-Run Claude Code on GPT-6 Astra (or any Codex-available model) billed to your ChatGPT
-subscription. A ~single-file localhost bridge: Anthropic Messages API in, OpenAI Responses
-API out, using the login your Codex CLI already holds.
+Run **Claude Code** on **GPT-6 Astra** (or any model your ChatGPT plan gives Codex), billed to your
+**ChatGPT subscription** — not a per-token API key.
 
-- No API key. No token storage. No dashboard. No tunnel. No root certificate. No telemetry.
-- Binds to 127.0.0.1 only. Tells OpenAI honestly who it is.
-- Zero dependencies (Bun).
+It is a small localhost bridge: Anthropic Messages API in (what Claude Code speaks), OpenAI
+Responses API out (what the Codex backend speaks), authenticated with the login your **Codex CLI**
+already holds. Same Claude Code — your skills, `CLAUDE.md`, subagents, tools — different brain.
 
-**Status: in development — not yet usable.**
+```
+claude ──► http://127.0.0.1:PORT (this bridge) ──► chatgpt.com/backend-api/codex
+           per-session token                       your Codex CLI login
+```
 
-Requires: [Bun](https://bun.sh), [Codex CLI](https://github.com/openai/codex) logged in
-with a ChatGPT Plus/Pro account, Claude Code.
+## Why this and not a router app
 
-> Relaying a ChatGPT subscription through a non-OpenAI client is not officially supported by
-> OpenAI. Personal, local use only. Consider a separate ChatGPT account.
+Router/proxy apps hold every prompt and every credential you give them. Source audits of two popular
+ones found plaintext credential storage and disabled TLS verification. This bridge is built so there
+is nothing to trust:
+
+- **No API key. No token storage.** It reads `~/.codex/auth.json` (Codex CLI's own file) and never writes it.
+- **127.0.0.1 only**, and every request needs a random per-session token — other local processes can't ride your session.
+- **No dashboard, no tunnel, no root certificate, no telemetry, no dependencies.** Two source files and a Bun runtime.
+- **Honest identity.** It tells OpenAI it is `claude-code-codex-bridge`. It does not impersonate Codex CLI.
+- **Nothing is ever logged** except event *types* (and only with `CCB_DEBUG=1`). Tokens never appear in errors.
+- **Only one upstream host.** Headers from Claude Code are never relayed; only six fixed headers go out.
+
+Read it in an afternoon: `src/sse.ts` (SSE decoder), `src/translate.ts` (the mapping), `src/bridge.ts` (the server).
+
+## Requirements
+
+- [Bun](https://bun.sh) ≥ 1.2
+- [Codex CLI](https://github.com/openai/codex) logged in with **ChatGPT Plus or Pro** (`codex login`). Free plans authenticate but the model call fails.
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
+
+## Install
+
+```bash
+git clone https://github.com/nathanhouse/claude-code-codex-bridge.git ~/claude-code-codex-bridge
+ln -s ~/claude-code-codex-bridge/cc-astra ~/.local/bin/cc-astra   # or any dir on your PATH
+```
+
+## Run
+
+```bash
+cc-astra                       # interactive Claude Code on gpt-6-astra
+cc-astra -p "explain this repo" # one-shot
+CCB_MODEL=gpt-5.6-terra cc-astra
+```
+
+Your normal `claude` command is untouched and still uses Anthropic. One provider per session: the
+bridge is bound at launch; start a new session to go back.
+
+| Env | Default | Meaning |
+|---|---|---|
+| `CCB_MODEL` | `gpt-6-astra` | model for Opus/Sonnet-class requests |
+| `CCB_SMALL_MODEL` | `= CCB_MODEL` | model for Haiku-class requests (titles, summaries, subagents) — set a cheaper one to save quota |
+| `CODEX_HOME` | `~/.codex` | where Codex CLI keeps `auth.json` |
+| `CCB_DEBUG` | unset | `1` logs upstream event types to stderr (never bodies) |
+
+Two harmless warnings appear on launch — "not a model this version of Claude Code recognizes" and
+"claude.ai connectors are disabled". Ignore them.
+
+## Verify it
+
+```bash
+bash selftest.sh          # unit tests + launcher dry-run on a simulated clean machine; no network
+bash selftest.sh --live   # + one text reply and one tool round-trip on your subscription
+```
+
+## What it does and doesn't do
+
+- **Does:** streaming, tool use (parallel calls included), tool results, images in user turns (base64
+  JPEG/PNG/GIF/WebP), thinking → `reasoning`, usage accounting (cached tokens mapped so Claude Code's
+  context tracking works), refusals, clean errors on every failure path.
+- **Doesn't:** enforce `max_tokens` (the Codex backend rejects an output ceiling — you get
+  `stop_reason: "max_tokens"` only when the backend stops itself); relay images inside tool results
+  (`[image omitted]`); refresh the login (the token lives ~10 days and Codex CLI refreshes it whenever
+  you use Codex — if you see *"Run: codex login"*, run it); `/v1/messages/count_tokens` is a deliberate
+  over-estimate.
+
+## The honest caveats
+
+- **OpenAI does not officially support relaying a ChatGPT subscription through a non-OpenAI client.**
+  This is personal, local use. Consider running it on a **separate ChatGPT account** from the one your
+  work lives on.
+- The Codex backend endpoint is **undocumented** and can change any week. The self-test tells you the
+  moment it does.
+- GPT-6 Astra is a frontier model: on a Plus plan you will hit the 5-hour window faster than you expect.
+  `CCB_SMALL_MODEL` helps.
+
+## Licence
+
+MIT — Nathan House.

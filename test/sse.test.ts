@@ -109,3 +109,17 @@ describe("T20 upstream caps", () => {
 		}).toThrow(SseTooLargeError);
 	});
 });
+
+describe("T20b event cap across many short data lines", () => {
+	test("undispatched data lines are capped by maxEventBytes", () => {
+		const d = new SseDecoder({ maxLineBytes: 1024, maxEventBytes: 4096 });
+		expect(() => {
+			for (let i = 0; i < 200; i++) d.push(`data: ${"z".repeat(50)}\n`);
+		}).toThrow(SseTooLargeError);
+	});
+	test("the event byte counter resets at dispatch", () => {
+		const d = new SseDecoder({ maxLineBytes: 1024, maxEventBytes: 4096 });
+		for (let i = 0; i < 200; i++) d.push(`data: ${"z".repeat(50)}\n\n`);
+		expect(true).toBe(true);
+	});
+});

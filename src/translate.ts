@@ -143,7 +143,7 @@ function userItems(blocks: Block[], where: string): Json[] {
 	return items;
 }
 
-function assistantItems(blocks: Block[]): Json[] {
+function assistantItems(blocks: Block[], warn?: (msg: string) => void): Json[] {
 	const items: Json[] = [];
 	let text: string[] = [];
 	const flush = () => {
@@ -165,6 +165,8 @@ function assistantItems(blocks: Block[]): Json[] {
 			flush();
 			const env = decodeEnvelope(b.signature);
 			if (env) items.push(...env.items);
+			// e.g. a session resumed from real Claude: its signatures aren't ours, so the reasoning is lost.
+			else warn?.("dropped a thinking block with a foreign or invalid signature");
 		}
 	}
 	flush();
@@ -200,7 +202,7 @@ export function toResponsesRequest(body: Json, opts: MapOptions): ResponsesReque
 	const input: Json[] = [];
 	messages.forEach((m, i) => {
 		const blocks = blocksOf(m.content);
-		if (m.role === "assistant") input.push(...assistantItems(blocks));
+		if (m.role === "assistant") input.push(...assistantItems(blocks, opts.warn));
 		else input.push(...userItems(blocks, `messages[${i}]`));
 	});
 
@@ -216,12 +218,18 @@ export function toResponsesRequest(body: Json, opts: MapOptions): ResponsesReque
 	if (Array.isArray(body.tools)) {
 		const tools: Json[] = [];
 		for (const t of body.tools as Json[]) {
-			if (t && typeof t === "object" && t.input_schema && typeof t.name === "string") {
+			const isFunction =
+				t &&
+				typeof t === "object" &&
+				typeof t.name === "string" &&
+				(!t.type || t.type === "custom");
+			if (isFunction) {
 				tools.push({
 					type: "function",
 					name: t.name,
 					description: String(t.description ?? ""),
-					parameters: t.input_schema,
+					// A tool with no schema is a zero-argument tool, not an invalid one.
+					parameters: t.input_schema ?? { type: "object", properties: {} },
 					strict: false,
 				});
 			} else {
@@ -256,6 +264,20 @@ interface OpenBlock {
 	index: number;
 	kind: "text" | "tool_use" | "thinking";
 	args: number; // bytes of tool arguments streamed so far
+	name?: string; // tool_use only — the name the block was opened with
+}
+
+/** A function_call whose name hasn't arrived yet: arguments are buffered until `output_item.done`. */
+interface PendingCall {
+	callId: string;
+	args: string[];
+	bytes: number;
+}
+
+interface ItemState {
+	kind: string;
+	blocks: Map<number, OpenBlock>;
+	pending?: PendingCall;
 }
 
 /** An item's open blocks in content_index order — the order they must be closed in. */
@@ -266,6 +288,8 @@ function inContentOrder(blocks: Map<number, OpenBlock>): OpenBlock[] {
 export interface MapperOptions {
 	/** Cap on streamed tool-call argument bytes per call. */
 	maxArgBytes?: number;
+	/** Sink for conditions that don't stop the stream but the operator should know about. */
+	warn?: (msg: string) => void;
 }
 
 function usageOf(u: unknown): Json {
@@ -285,17 +309,25 @@ export class ResponsesToAnthropic {
 	private finished = false;
 	private nextIndex = 0;
 	/** item_id → the item's kind and its open blocks keyed by content_index (0 for non-message items). */
-	private readonly items = new Map<string, { kind: string; blocks: Map<number, OpenBlock> }>();
+	private readonly items = new Map<string, ItemState>();
 	private sawToolUse = false;
 	private sawRefusal = false;
+	private droppedDeltas = 0;
 	private readonly maxArgBytes: number;
+	private readonly warn: (msg: string) => void;
 
 	constructor(opts: MapperOptions = {}) {
 		this.maxArgBytes = opts.maxArgBytes ?? 4 * 1024 * 1024;
+		this.warn = opts.warn ?? (() => undefined);
 	}
 
 	get done(): boolean {
 		return this.finished;
+	}
+
+	/** Deltas that arrived for a block we never opened — a sign the upstream event shape changed. */
+	get dropped(): number {
+		return this.droppedDeltas;
 	}
 
 	push(raw: unknown): AnthropicEvent[] {
@@ -329,9 +361,19 @@ export class ResponsesToAnthropic {
 			case "response.function_call_arguments.delta": {
 				const itemId = String(ev.item_id ?? "");
 				const chunk = String(ev.delta ?? "");
-				const block = this.items.get(itemId)?.blocks.get(0);
+				const bytes = Buffer.byteLength(chunk, "utf8");
+				const entry = this.items.get(itemId);
+				const pending = entry?.pending;
+				if (pending && !entry.blocks.has(0)) {
+					pending.bytes += bytes;
+					if (pending.bytes > this.maxArgBytes)
+						return this.fail(out, "tool call arguments too large");
+					pending.args.push(chunk); // name not known yet — replayed at output_item.done
+					break;
+				}
+				const block = entry?.blocks.get(0);
 				if (block) {
-					block.args += Buffer.byteLength(chunk, "utf8");
+					block.args += bytes;
 					if (block.args > this.maxArgBytes) return this.fail(out, "tool call arguments too large");
 				}
 				this.delta(out, itemId, 0, { type: "input_json_delta", partial_json: chunk });
@@ -368,7 +410,10 @@ export class ResponsesToAnthropic {
 	finish(reason = "upstream ended before completion"): AnthropicEvent[] {
 		if (this.finished) return [];
 		const out: AnthropicEvent[] = [];
-		this.fail(out, reason);
+		const detail = this.droppedDeltas
+			? ` (${this.droppedDeltas} deltas had no block to land in)`
+			: "";
+		this.fail(out, reason + detail);
 		return out;
 	}
 
@@ -406,12 +451,38 @@ export class ResponsesToAnthropic {
 		contentIndex: number,
 		kind: OpenBlock["kind"],
 		contentBlock: Json,
-	): void {
-		const entry = this.items.get(itemId) ?? { kind, blocks: new Map<number, OpenBlock>() };
-		this.items.set(itemId, entry);
+	): OpenBlock {
+		const entry = this.entry(itemId, kind);
 		const block: OpenBlock = { index: this.nextIndex++, kind, args: 0 };
 		entry.blocks.set(contentIndex, block);
 		out.push({ type: "content_block_start", index: block.index, content_block: contentBlock });
+		return block;
+	}
+
+	/** The state for an item — created on first sight, never replaced (upstreams do re-emit `added`). */
+	private entry(itemId: string, kind: string): ItemState {
+		let entry = this.items.get(itemId);
+		if (!entry) {
+			entry = { kind, blocks: new Map() };
+			this.items.set(itemId, entry);
+		}
+		return entry;
+	}
+
+	private openToolUse(
+		out: AnthropicEvent[],
+		itemId: string,
+		callId: string,
+		name: string,
+	): OpenBlock {
+		const block = this.open(out, itemId, 0, "tool_use", {
+			type: "tool_use",
+			id: callId,
+			name,
+			input: {},
+		});
+		block.name = name;
+		return block;
 	}
 
 	private itemAdded(out: AnthropicEvent[], item: Json | undefined): void {
@@ -420,16 +491,18 @@ export class ResponsesToAnthropic {
 		const type = String(item.type ?? "");
 		if (type === "function_call") {
 			this.sawToolUse = true;
-			this.open(out, id, 0, "tool_use", {
-				type: "tool_use",
-				id: String(item.call_id ?? item.id ?? ""),
-				name: String(item.name ?? ""),
-				input: {},
-			});
+			if (this.items.get(id)?.blocks.has(0) || this.items.get(id)?.pending) return; // duplicate `added`
+			const callId = String(item.call_id ?? item.id ?? "");
+			const name = String(item.name ?? "");
+			if (name) this.openToolUse(out, id, callId, name);
+			// The name may arrive empty on `added` and be filled on `done`; Anthropic can't rename an open block,
+			// so hold the block (and its argument deltas) until we know it.
+			else this.entry(id, type).pending = { callId, args: [], bytes: 0 };
 		} else if (type === "reasoning") {
-			this.open(out, id, 0, "thinking", { type: "thinking", thinking: "" });
+			if (!this.items.get(id)?.blocks.has(0))
+				this.open(out, id, 0, "thinking", { type: "thinking", thinking: "" });
 		} else {
-			this.items.set(id, { kind: type, blocks: new Map() });
+			this.entry(id, type);
 		}
 	}
 
@@ -447,7 +520,10 @@ export class ResponsesToAnthropic {
 
 	private delta(out: AnthropicEvent[], itemId: string, contentIndex: number, delta: Json): void {
 		const block = this.items.get(itemId)?.blocks.get(contentIndex);
-		if (!block) return;
+		if (!block) {
+			this.droppedDeltas++;
+			return;
+		}
 		out.push({ type: "content_block_delta", index: block.index, delta });
 	}
 
@@ -456,7 +532,29 @@ export class ResponsesToAnthropic {
 		const id = String(item.id ?? "");
 		const entry = this.items.get(id);
 		if (!entry) return;
+		if (entry.pending && !entry.blocks.has(0)) {
+			// Deferred function_call: now we have the authoritative name — emit the whole block at once.
+			const name = String(item.name ?? "");
+			if (!name) {
+				this.fail(out, "upstream tool call arrived without a name");
+				return;
+			}
+			this.openToolUse(out, id, entry.pending.callId, name);
+			const args = entry.pending.args.length
+				? entry.pending.args.join("")
+				: String(item.arguments ?? "");
+			if (args) this.delta(out, id, 0, { type: "input_json_delta", partial_json: args });
+			entry.pending = undefined;
+		}
 		for (const block of inContentOrder(entry.blocks)) {
+			if (block.kind === "tool_use" && item.name && block.name !== String(item.name)) {
+				// Anthropic's wire format has no way to rename an already-started tool_use block.
+				this.fail(
+					out,
+					`upstream renamed a tool call mid-stream (${block.name} → ${String(item.name)})`,
+				);
+				return;
+			}
 			if (block.kind === "thinking")
 				out.push({
 					type: "content_block_delta",
@@ -482,6 +580,9 @@ export class ResponsesToAnthropic {
 			const reason = String(((response.incomplete_details ?? {}) as Json).reason ?? "");
 			if (reason === "max_tokens") return "max_tokens";
 			if (reason === "content_filter") return "refusal";
+			this.warn(
+				`upstream reported an incomplete response (reason "${reason}") — passed on as end_turn`,
+			);
 		}
 		if (this.sawToolUse) return "tool_use";
 		if (this.sawRefusal) return "refusal";
@@ -491,6 +592,8 @@ export class ResponsesToAnthropic {
 	private complete(out: AnthropicEvent[], response: Json | undefined): void {
 		this.ensureStarted(out);
 		this.closeAll(out);
+		if (!response?.usage)
+			this.warn("upstream reported no usage — Claude Code's context accounting will be wrong");
 		out.push({
 			type: "message_delta",
 			delta: { stop_reason: this.stopReason(response), stop_sequence: null },
@@ -516,13 +619,13 @@ export class UpstreamError extends Error {
 	}
 }
 
-/** Streamed tool arguments may be truncated or malformed; an unparseable call degrades to empty input. */
-function parseInput(json: string): unknown {
+/** Streamed tool arguments must be JSON; a malformed call is an upstream failure, not an empty call. */
+function parseInput(name: string, json: string): unknown {
 	if (!json) return {};
 	try {
 		return JSON.parse(json);
 	} catch {
-		return {};
+		throw new UpstreamError(`tool call "${name}" returned arguments that are not valid JSON`);
 	}
 }
 
@@ -585,7 +688,7 @@ export function aggregate(events: AnthropicEvent[]): Json {
 			}
 			case "message_delta":
 				stop_reason = (ev.delta as Json).stop_reason;
-				usage = ev.usage as Json;
+				if (ev.usage) usage = ev.usage as Json;
 				break;
 			default:
 				break;
@@ -595,7 +698,12 @@ export function aggregate(events: AnthropicEvent[]): Json {
 		.sort((a, b) => a[0] - b[0])
 		.map(([, b]) => {
 			if (b.type === "tool_use")
-				return { type: "tool_use", id: b.id ?? "", name: b.name ?? "", input: parseInput(b.json) };
+				return {
+					type: "tool_use",
+					id: b.id ?? "",
+					name: b.name ?? "",
+					input: parseInput(b.name ?? "", b.json),
+				};
 			if (b.type === "thinking")
 				return { type: "thinking", thinking: b.text, signature: b.signature ?? "" };
 			return { type: "text", text: b.text };

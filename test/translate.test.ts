@@ -727,3 +727,154 @@ describe("T18 images", () => {
 		}
 	});
 });
+
+describe("review fixes: tool-call state machine", () => {
+	const add = (name: string) => ({
+		type: "response.output_item.added",
+		output_index: 0,
+		item: {
+			id: "fc_1",
+			type: "function_call",
+			call_id: "call_1",
+			name,
+			arguments: "",
+			status: "in_progress",
+		},
+	});
+	const argDelta = (d: string) => ({
+		type: "response.function_call_arguments.delta",
+		item_id: "fc_1",
+		output_index: 0,
+		delta: d,
+	});
+	const done = (name: string) => ({
+		type: "response.output_item.done",
+		output_index: 0,
+		item: {
+			id: "fc_1",
+			type: "function_call",
+			call_id: "call_1",
+			name,
+			arguments: '{"x":1}',
+			status: "completed",
+		},
+	});
+	test("name empty at added, filled at done → block emitted at done with the real name and buffered args", () => {
+		const out = run([
+			created,
+			add(""),
+			argDelta('{"x":'),
+			argDelta("1}"),
+			done("Bash"),
+			completed(USAGE),
+		]);
+		const start = out.find((e) => e.type === "content_block_start") as unknown as {
+			content_block: { name: string };
+		};
+		expect(start.content_block.name).toBe("Bash");
+		const deltas = out.filter((e) => e.type === "content_block_delta") as unknown as {
+			delta: { partial_json: string };
+		}[];
+		expect(deltas.map((d) => d.delta.partial_json).join("")).toBe('{"x":1}');
+		expect(aggregate(out).content).toEqual([
+			{ type: "tool_use", id: "call_1", name: "Bash", input: { x: 1 } },
+		]);
+	});
+	test("name changed between added and done → one error, no message_stop", () => {
+		const out = run([created, add("Read"), argDelta("{}"), done("Bash"), completed(USAGE)]);
+		expect(out.filter((e) => e.type === "error").length).toBe(1);
+		expect(out.filter((e) => e.type === "message_stop").length).toBe(0);
+	});
+	test("duplicate output_item.added for a message keeps its open blocks", () => {
+		const out = run([
+			created,
+			msgAdded,
+			partText,
+			delta("po"),
+			msgAdded,
+			delta("ng"),
+			msgDone,
+			completed(USAGE),
+		]);
+		expect(out.filter((e) => e.type === "content_block_delta").length).toBe(2);
+		expect(out.filter((e) => e.type === "content_block_stop").length).toBe(1);
+		expect(aggregate(out).content).toEqual([{ type: "text", text: "pong" }]);
+	});
+	test("non-JSON tool arguments → aggregate throws UpstreamError", () => {
+		const out = run([created, add("Bash"), argDelta("{not json"), done("Bash"), completed(USAGE)]);
+		expect(() => aggregate(out)).toThrow(/not valid JSON/);
+	});
+	test("message_delta without usage keeps the zero usage object", () => {
+		const msg = aggregate([
+			{ type: "message_start", message: { id: "m", model: "x" } },
+			{ type: "message_delta", delta: { stop_reason: "end_turn" } },
+			{ type: "message_stop" },
+		]);
+		expect(msg.usage).toEqual({
+			input_tokens: 0,
+			cache_creation_input_tokens: 0,
+			cache_read_input_tokens: 0,
+			output_tokens: 0,
+		});
+	});
+	test("warn fires on missing usage and on an unknown incomplete reason", () => {
+		const warnings: string[] = [];
+		const m = new ResponsesToAnthropic({ warn: (w) => warnings.push(w) });
+		m.push(created);
+		m.push({
+			type: "response.incomplete",
+			response: { id: "r", status: "incomplete", incomplete_details: { reason: "weird" } },
+		});
+		expect(warnings.some((w) => w.includes("no usage"))).toBe(true);
+		expect(warnings.some((w) => w.includes("weird"))).toBe(true);
+	});
+});
+
+describe("review fixes: request mapping", () => {
+	const base = {
+		model: "claude-opus-5",
+		max_tokens: 1,
+		messages: [{ role: "user", content: "x" }],
+	};
+	test("a tool without input_schema is kept with an empty schema; a server tool type is dropped", () => {
+		const warnings: string[] = [];
+		const out = toResponsesRequest(
+			{
+				...base,
+				tools: [
+					{ name: "NoArgs", description: "d" },
+					{ type: "web_search_20250305", name: "web_search" },
+				],
+			},
+			{ ...OPTS, warn: (w) => warnings.push(w) },
+		);
+		expect(out.tools).toEqual([
+			{
+				type: "function",
+				name: "NoArgs",
+				description: "d",
+				parameters: { type: "object", properties: {} },
+				strict: false,
+			},
+		]);
+		expect(warnings.length).toBe(1);
+		expect(warnings[0]).toContain("web_search_20250305");
+	});
+	test("a foreign thinking signature warns once via opts.warn", () => {
+		const warnings: string[] = [];
+		toResponsesRequest(
+			{
+				...base,
+				messages: [
+					{ role: "user", content: "q" },
+					{
+						role: "assistant",
+						content: [{ type: "thinking", thinking: "t", signature: "sig_from_anthropic" }],
+					},
+				],
+			},
+			{ ...OPTS, warn: (w) => warnings.push(w) },
+		);
+		expect(warnings.some((w) => w.includes("foreign or invalid signature"))).toBe(true);
+	});
+});

@@ -19,7 +19,7 @@ const T3_SSE = [
 	'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":60},"output_tokens":2}}}\n\n',
 ].join("");
 
-type Mode = "ok" | "401" | "huge";
+type Mode = "ok" | "401" | "huge" | "400msg" | "429";
 let mode: Mode = "ok";
 let lastHeaders: Record<string, string> = {};
 let lastBody: Record<string, unknown> = {};
@@ -31,6 +31,16 @@ const upstream = Bun.serve({
 		lastHeaders = Object.fromEntries(req.headers.entries());
 		lastBody = (await req.json()) as Record<string, unknown>;
 		if (mode === "401") return new Response(`invalid token ${ACCESS}`, { status: 401 });
+		if (mode === "400msg")
+			return Response.json(
+				{ error: { message: `Unsupported model gpt-typo for Bearer ${ACCESS}` } },
+				{ status: 400 },
+			);
+		if (mode === "429")
+			return Response.json(
+				{ error: { message: "usage limit reached" } },
+				{ status: 429, headers: { "retry-after": "120" } },
+			);
 		if (mode === "huge")
 			return new Response(`data: ${"x".repeat(5 * 1024 * 1024)}\n\n`, {
 				headers: { "Content-Type": "text/event-stream" },
@@ -232,4 +242,121 @@ describe("T19 parent-PID watchdog", () => {
 		const code = await Promise.race([child.exited, Bun.sleep(5000).then(() => -1)]);
 		expect(code).toBe(0);
 	}, 10_000);
+});
+
+describe("review fixes: what the user is told", () => {
+	test("upstream 400 with a message → 502 that relays the reason, token redacted", async () => {
+		mode = "400msg";
+		const r = await post("/v1/messages", BODY, { Authorization: `Bearer ${LOCAL}` });
+		expect(r.status).toBe(502);
+		const j = (await r.json()) as { error: { message: string } };
+		expect(j.error.message).toContain("HTTP 400");
+		expect(j.error.message).toContain("Unsupported model gpt-typo");
+		expect(j.error.message).not.toContain(ACCESS);
+		mode = "ok";
+	});
+	test("upstream 429 → 429 with the reason and retry-after forwarded", async () => {
+		mode = "429";
+		const r = await post("/v1/messages", BODY, { Authorization: `Bearer ${LOCAL}` });
+		expect(r.status).toBe(429);
+		expect(r.headers.get("retry-after")).toBe("120");
+		expect(
+			((await r.json()) as { error: { type: string; message: string } }).error.message,
+		).toContain("usage limit reached");
+		mode = "ok";
+	});
+	test("unreachable backend → 502 naming the cause, not 'bridge internal error'", async () => {
+		const closed = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("x") });
+		const port = closed.port;
+		closed.stop(true);
+		const dead = await startBridge({
+			host: "127.0.0.1",
+			port: 0,
+			localToken: LOCAL,
+			upstream: `http://127.0.0.1:${port}`,
+			codexHome,
+			model: "m",
+			smallModel: "m",
+			debug: false,
+			log: () => undefined,
+			maxBodyBytes: 1024 * 1024,
+			maxLineBytes: 1024 * 1024,
+		});
+		const r = await fetch(`http://127.0.0.1:${dead.port}/v1/messages`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Authorization: `Bearer ${LOCAL}` },
+			body: JSON.stringify(BODY),
+		});
+		expect(r.status).toBe(502);
+		expect(((await r.json()) as { error: { message: string } }).error.message).toContain(
+			"Could not reach the Codex backend",
+		);
+		dead.stop();
+	});
+	test("a JSON body that is not an object → 400, not 500", async () => {
+		const r = await fetch(url("/v1/messages"), {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Authorization: `Bearer ${LOCAL}` },
+			body: "null",
+		});
+		expect(r.status).toBe(400);
+		expect(((await r.json()) as { error: { message: string } }).error.message).toContain(
+			"JSON object",
+		);
+	});
+	test("auth.json without an access token explains itself", async () => {
+		const home = mkdtempSync(join(tmpdir(), "ccb-noauth-"));
+		writeFileSync(
+			join(home, "auth.json"),
+			JSON.stringify({ auth_mode: "apikey", OPENAI_API_KEY: "sk-x" }),
+		);
+		const b = await startBridge({
+			host: "127.0.0.1",
+			port: 0,
+			localToken: LOCAL,
+			upstream: `http://127.0.0.1:${upstream.port}`,
+			codexHome: home,
+			model: "m",
+			smallModel: "m",
+			debug: false,
+			log: () => undefined,
+			maxBodyBytes: 1024 * 1024,
+			maxLineBytes: 1024 * 1024,
+		});
+		const r = await fetch(`http://127.0.0.1:${b.port}/v1/messages`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Authorization: `Bearer ${LOCAL}` },
+			body: JSON.stringify(BODY),
+		});
+		expect(r.status).toBe(401);
+		expect(((await r.json()) as { error: { message: string } }).error.message).toContain(
+			"tokens.access_token",
+		);
+		b.stop();
+	});
+	test("non-streaming reply over the aggregate cap → 502, no hang", async () => {
+		mode = "ok";
+		const small = await startBridge({
+			host: "127.0.0.1",
+			port: 0,
+			localToken: LOCAL,
+			upstream: `http://127.0.0.1:${upstream.port}/backend-api/codex`,
+			codexHome,
+			model: "m",
+			smallModel: "m",
+			debug: false,
+			log: () => undefined,
+			maxBodyBytes: 1024 * 1024,
+			maxLineBytes: 1024 * 1024,
+			maxAggregateBytes: 64,
+		});
+		const r = await fetch(`http://127.0.0.1:${small.port}/v1/messages`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Authorization: `Bearer ${LOCAL}` },
+			body: JSON.stringify({ ...BODY, stream: false }),
+		});
+		expect(r.status).toBe(502);
+		expect(((await r.json()) as { error: { message: string } }).error.message).toContain("exceeds");
+		small.stop();
+	});
 });

@@ -26,14 +26,29 @@ TOKEN="$(LC_ALL=C tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 48)"
 
 OUT="$(mktemp)"; ERR="$(mktemp)"
 BRIDGE_PID=""
+ERR_SHOWN=0
 cleanup() {
-	[ -n "$BRIDGE_PID" ] && kill "$BRIDGE_PID" 2>/dev/null
-	rm -f "$OUT" "$ERR"
+	if [ -n "$BRIDGE_PID" ]; then
+		if kill -0 "$BRIDGE_PID" 2>/dev/null; then
+			kill "$BRIDGE_PID" 2>/dev/null
+		elif [ "$ERR_SHOWN" = 0 ] && [ -s "$ERR" ] && [ "${CCB_DRY_RUN:-0}" != "1" ]; then
+			# The bridge died during the session — this is the only copy of why.
+			printf 'cc-astra: the bridge exited unexpectedly; its stderr was:\n' >&2
+			cat "$ERR" >&2
+		fi
+	fi
+	if [ "${CCB_DEBUG:-0}" = "1" ]; then
+		printf 'cc-astra: bridge log kept at %s\n' "$ERR" >&2
+		rm -f "$OUT"
+	else
+		rm -f "$OUT" "$ERR"
+	fi
 }
 trap cleanup EXIT INT TERM
 
 CCB_LOCAL_TOKEN="$TOKEN" CCB_PARENT_PID="$$" CCB_PORT=0 CCB_HOST=127.0.0.1 \
 CCB_MODEL="$CCB_MODEL" CCB_SMALL_MODEL="$CCB_SMALL_MODEL" CODEX_HOME="$CODEX_HOME" \
+CCB_DEBUG="${CCB_DEBUG:-}" \
 	bun run "$DIR/src/bridge.ts" >"$OUT" 2>"$ERR" &
 BRIDGE_PID=$!
 
@@ -46,8 +61,12 @@ for _ in $(seq 1 50); do
 	sleep 0.1
 done
 if [ -z "$PORT" ]; then
-	cat "$ERR" >&2
-	die "bridge failed to start" 3
+	cat "$ERR" >&2; ERR_SHOWN=1
+	if kill -0 "$BRIDGE_PID" 2>/dev/null; then
+		die "bridge did not report a port within 5 s (try CCB_DEBUG=1)" 3
+	fi
+	wait "$BRIDGE_PID"; CODE=$?
+	die "bridge exited with code $CODE before it was ready" 3
 fi
 # Surface bridge warnings (permissions, missing login) once, then keep stderr quiet.
 [ -s "$ERR" ] && cat "$ERR" >&2
@@ -70,6 +89,7 @@ printf 'cc-astra: bridge 127.0.0.1:%s → %s (ChatGPT subscription via Codex log
 
 if [ "${CCB_DRY_RUN:-0}" = "1" ]; then
 	env | grep -E '^(ANTHROPIC_|CLAUDE_CODE_SUBAGENT_MODEL|DISABLE_TELEMETRY)' | sed "s/$TOKEN/<token>/"
+	printf 'CCB_BRIDGE_PID=%s\n' "$BRIDGE_PID"
 	exit 0
 fi
 

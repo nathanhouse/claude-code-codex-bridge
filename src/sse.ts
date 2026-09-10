@@ -17,6 +17,8 @@ export interface SseEvent {
 export interface SseDecoderOptions {
 	/** Maximum bytes a single line (or a partial line waiting for its end) may hold. */
 	maxLineBytes?: number;
+	/** Maximum bytes of `data:` an undispatched event may accumulate across lines. */
+	maxEventBytes?: number;
 }
 
 /**
@@ -25,14 +27,17 @@ export interface SseDecoderOptions {
  */
 export class SseDecoder {
 	private readonly max: number;
+	private readonly maxEvent: number;
 	private readonly decoder = new TextDecoder("utf-8");
 	private buf = "";
 	private eventName: string | undefined;
 	private id: string | undefined;
 	private dataLines: string[] = [];
+	private dataBytes = 0;
 
 	constructor(opts: SseDecoderOptions = {}) {
 		this.max = opts.maxLineBytes ?? 1024 * 1024;
+		this.maxEvent = opts.maxEventBytes ?? 4 * 1024 * 1024;
 	}
 
 	push(chunk: string | Uint8Array): SseEvent[] {
@@ -57,12 +62,19 @@ export class SseDecoder {
 		const unterminated = this.buf.length > 0 || this.dataLines.length > 0;
 		this.buf = "";
 		this.dataLines = [];
+		this.dataBytes = 0;
 		return { events: [], unterminated };
 	}
 
 	private guard(s: string): void {
 		const bytes = Buffer.byteLength(s, "utf8");
 		if (bytes > this.max) throw new SseTooLargeError(bytes, this.max);
+	}
+
+	/** Many short `data:` lines with no dispatching blank line must not grow the event without bound. */
+	private guardEvent(added: string): void {
+		this.dataBytes += Buffer.byteLength(added, "utf8") + 1;
+		if (this.dataBytes > this.maxEvent) throw new SseTooLargeError(this.dataBytes, this.maxEvent);
 	}
 
 	/** Index of the next line terminator; holds back a trailing CR that may be half of CRLF. */
@@ -91,6 +103,7 @@ export class SseDecoder {
 				this.eventName = value;
 				break;
 			case "data":
+				this.guardEvent(value);
 				this.dataLines.push(value);
 				break;
 			case "id":
@@ -108,6 +121,7 @@ export class SseDecoder {
 		// Per spec the event name resets at every dispatch, data included or not; `id` persists.
 		this.eventName = undefined;
 		this.dataLines = [];
+		this.dataBytes = 0;
 		if (dataLines.length === 0) return null;
 		const ev: SseEvent = { data: dataLines.join("\n") };
 		if (eventName !== undefined) ev.event = eventName;

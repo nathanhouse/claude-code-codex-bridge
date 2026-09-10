@@ -33,6 +33,8 @@ export interface BridgeConfig {
 	log: (line: string) => void;
 	maxBodyBytes: number;
 	maxLineBytes: number;
+	/** Cap on a non-streaming (stream:false) reply assembled in memory. */
+	maxAggregateBytes?: number;
 	upstreamIdleMs?: number;
 	parentPid?: number;
 	watchdogMs?: number;
@@ -63,27 +65,66 @@ interface CodexAuth {
 	accountId: string;
 }
 
-function readCodexAuth(codexHome: string): CodexAuth | null {
+/** Five different failures used to collapse into "run: codex login"; each now says what is actually wrong. */
+function readCodexAuth(codexHome: string): { auth: CodexAuth } | { error: string } {
+	const path = join(codexHome, "auth.json");
+	let text: string;
 	try {
-		const raw = JSON.parse(readFileSync(join(codexHome, "auth.json"), "utf8")) as {
-			tokens?: { access_token?: string; account_id?: string };
-		};
-		const accessToken = raw.tokens?.access_token;
-		if (!accessToken) return null;
-		return { accessToken, accountId: raw.tokens?.account_id ?? "" };
-	} catch {
-		return null;
+		text = readFileSync(path, "utf8");
+	} catch (err) {
+		const code = (err as { code?: string }).code ?? "error";
+		if (code === "ENOENT") return { error: "No Codex login found. Run: codex login" };
+		return { error: `Cannot read ${path} (${code})` };
 	}
+	let raw: { tokens?: { access_token?: string; account_id?: string } };
+	try {
+		raw = JSON.parse(text);
+	} catch {
+		return {
+			error: `${path} is not valid JSON (Codex CLI may be mid-write — retry, or run: codex login)`,
+		};
+	}
+	const accessToken = raw?.tokens?.access_token;
+	if (!accessToken)
+		return {
+			error: `${path} has no tokens.access_token — log in with ChatGPT (codex login), not an API key`,
+		};
+	return { auth: { accessToken, accountId: raw.tokens?.account_id ?? "" } };
 }
 
 function warnIfLoosePermissions(codexHome: string, log: (l: string) => void): void {
+	const path = join(codexHome, "auth.json");
 	try {
-		const mode = statSync(join(codexHome, "auth.json")).mode & 0o777;
-		if (mode !== 0o600)
-			log(`warning: ${join(codexHome, "auth.json")} is not 0600 (mode ${mode.toString(8)})`);
-	} catch {
-		log(`warning: ${join(codexHome, "auth.json")} not found — run: codex login`);
+		const mode = statSync(path).mode & 0o777;
+		if (mode !== 0o600) log(`warning: ${path} is not 0600 (mode ${mode.toString(8)})`);
+	} catch (err) {
+		const code = (err as { code?: string }).code ?? "error";
+		if (code === "ENOENT") log(`warning: ${path} not found — run: codex login`);
+		else log(`warning: cannot stat ${path} (${code})`);
 	}
+}
+
+/** Pull a human-readable reason out of an upstream error body without ever relaying the token. */
+async function upstreamReason(res: Response, secret: string): Promise<string> {
+	let text = "";
+	try {
+		text = (await res.text()).slice(0, 64 * 1024);
+	} catch {
+		return "";
+	}
+	let message = "";
+	try {
+		const parsed = JSON.parse(text) as { error?: { message?: unknown }; detail?: unknown };
+		if (typeof parsed?.error?.message === "string") message = parsed.error.message;
+		else if (typeof parsed?.detail === "string") message = parsed.detail;
+	} catch {
+		message = "";
+	}
+	if (!message) return "";
+	return message
+		.replaceAll(secret, "<token>")
+		.replace(/Bearer \S+/g, "Bearer <token>")
+		.slice(0, 300);
 }
 
 /** Reads one chunk with an idle timeout; the timer is cleared as soon as data arrives. */
@@ -138,7 +179,7 @@ export async function startBridge(cfg: BridgeConfig) {
 		res: Response,
 		abort: AbortController,
 	): AsyncGenerator<AnthropicEvent> {
-		const mapper = new ResponsesToAnthropic();
+		const mapper = new ResponsesToAnthropic({ warn: warnOnce });
 		const decoder = new SseDecoder({ maxLineBytes: cfg.maxLineBytes });
 		const reader = res.body?.getReader();
 		if (!reader) {
@@ -155,7 +196,9 @@ export async function startBridge(cfg: BridgeConfig) {
 					try {
 						parsed = JSON.parse(frame.data);
 					} catch {
-						continue; // a malformed frame is skipped, not fatal
+						// A malformed frame is skipped, not fatal — but it is the first sign of an upstream change.
+						if (cfg.debug) cfg.log(`undecodable upstream frame (${frame.data.length} chars)`);
+						continue;
 					}
 					if (cfg.debug)
 						cfg.log(`upstream event ${String((parsed as { type?: string })?.type ?? "?")}`);
@@ -206,6 +249,8 @@ export async function startBridge(cfg: BridgeConfig) {
 		} catch {
 			return anthropicError(400, "invalid_request_error", "body is not valid JSON");
 		}
+		if (!body || typeof body !== "object" || Array.isArray(body))
+			return anthropicError(400, "invalid_request_error", "body must be a JSON object");
 
 		let upstreamBody: Record<string, unknown>;
 		try {
@@ -221,16 +266,41 @@ export async function startBridge(cfg: BridgeConfig) {
 			throw err;
 		}
 
-		let auth = readCodexAuth(cfg.codexHome);
-		if (!auth)
-			return anthropicError(401, "authentication_error", "No Codex login found. Run: codex login");
+		let read = readCodexAuth(cfg.codexHome);
+		if ("error" in read) return anthropicError(401, "authentication_error", read.error);
+		let auth = read.auth;
 
 		const abort = new AbortController();
-		let res = await callUpstream(upstreamBody, auth, abort.signal);
-		if (res.status === 401) {
-			// Codex CLI may have rotated the token since we last read the file.
-			auth = readCodexAuth(cfg.codexHome);
-			if (auth) res = await callUpstream(upstreamBody, auth, abort.signal);
+		const reach = async (): Promise<Response> => {
+			try {
+				return await callUpstream(upstreamBody, auth, abort.signal);
+			} catch (err) {
+				// fetch itself failed: no network, DNS, TLS interception, backend down. Carries no token or body.
+				const code =
+					(err as { code?: string; name?: string }).code ?? (err as Error).name ?? "error";
+				cfg.log(`upstream unreachable: ${code}`);
+				throw new UpstreamError(
+					`Could not reach the Codex backend (${code}). Check your network connection.`,
+				);
+			}
+		};
+		let res: Response;
+		try {
+			res = await reach();
+			if (res.status === 401) {
+				// Codex CLI may have rotated the token since we last read the file.
+				read = readCodexAuth(cfg.codexHome);
+				if ("auth" in read) {
+					auth = read.auth;
+					res = await reach();
+				}
+			}
+		} catch (err) {
+			return anthropicError(
+				502,
+				"api_error",
+				err instanceof UpstreamError ? err.message : "upstream error",
+			);
 		}
 		if (res.status === 401) {
 			if (cfg.debug) cfg.log("upstream 401");
@@ -240,23 +310,36 @@ export async function startBridge(cfg: BridgeConfig) {
 				"Codex login rejected or expired. Run: codex login",
 			);
 		}
-		if (res.status === 429)
-			return anthropicError(
-				429,
-				"rate_limit_error",
-				"ChatGPT subscription rate limit reached. Try again later.",
-			);
 		if (!res.ok) {
 			if (cfg.debug) cfg.log(`upstream ${res.status}`);
-			return anthropicError(502, "api_error", `upstream returned HTTP ${res.status}`);
+			const reason = await upstreamReason(res, auth.accessToken);
+			const suffix = reason ? `: ${reason}` : "";
+			if (res.status === 429) {
+				const r = anthropicError(
+					429,
+					"rate_limit_error",
+					`ChatGPT subscription rate limit reached${suffix}`,
+				);
+				const retry = res.headers.get("retry-after");
+				if (retry) r.headers.set("retry-after", retry);
+				return r;
+			}
+			return anthropicError(502, "api_error", `upstream returned HTTP ${res.status}${suffix}`);
 		}
 
 		if (body.stream === false) {
+			const cap = cfg.maxAggregateBytes ?? 16 * 1024 * 1024;
 			const events: AnthropicEvent[] = [];
-			for await (const ev of translateStream(res, abort)) events.push(ev);
+			let bytes = 0;
 			try {
+				for await (const ev of translateStream(res, abort)) {
+					bytes += JSON.stringify(ev).length;
+					if (bytes > cap) throw new UpstreamError(`non-streaming reply exceeds ${cap} bytes`);
+					events.push(ev);
+				}
 				return Response.json(aggregate(events), { headers: JSON_HEADERS });
 			} catch (err) {
+				abort.abort();
 				return anthropicError(
 					502,
 					"api_error",

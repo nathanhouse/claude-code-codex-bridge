@@ -14,6 +14,10 @@ export interface MapOptions {
 	cacheKey: string;
 	/** Optional sink for one-off warnings (unsupported tool types etc.). */
 	warn?: (msg: string) => void;
+	/** Reasoning effort to request when the client asks for thinking without a budget (default "medium" — the model's own default). Overrides any budget when set explicitly. */
+	reasoningEffort?: string;
+	/** Backend service tier, e.g. "priority" (the "Fast" tier: ~2× speed, more usage). Omitted when unset. */
+	serviceTier?: string;
 }
 
 /** The Responses-API body we send upstream (index signature: unknown extras are allowed but never added by us). */
@@ -26,8 +30,9 @@ export interface ResponsesRequest {
 	prompt_cache_key: string;
 	tools?: Json[];
 	tool_choice?: unknown;
-	reasoning?: { effort: "low" | "medium" | "high"; summary: "auto" };
+	reasoning?: { effort: string; summary: "auto" };
 	include?: string[];
+	service_tier?: string;
 	[extra: string]: unknown;
 }
 
@@ -61,7 +66,8 @@ export function decodeEnvelope(signature: unknown): { items: Json[] } | null {
 
 // ---------- request: Anthropic → Responses ----------
 function mapModel(name: unknown, opts: MapOptions): string {
-	const m = typeof name === "string" ? name : "";
+	// Claude Code's "[1m]" suffix is a client-side context hint, never part of the id sent upstream.
+	const m = (typeof name === "string" ? name : "").replace(/\[1m\]$/i, "");
 	if (/haiku/i.test(m)) return opts.smallModel;
 	if (/^claude/i.test(m)) return opts.model;
 	return m || opts.model;
@@ -190,10 +196,9 @@ function mapToolChoice(tc: unknown): unknown {
 	}
 }
 
-function effortOf(budget: unknown): "low" | "medium" | "high" {
-	const n = typeof budget === "number" ? budget : 16000;
-	if (n < 4000) return "low";
-	if (n < 16000) return "medium";
+function effortOf(budget: number): "low" | "medium" | "high" {
+	if (budget < 4000) return "low";
+	if (budget < 16000) return "medium";
 	return "high";
 }
 
@@ -245,15 +250,25 @@ export function toResponsesRequest(body: Json, opts: MapOptions): ResponsesReque
 
 	const thinking = body.thinking as Json | undefined;
 	if (thinking && thinking.type !== "disabled") {
-		out.reasoning = { effort: effortOf(thinking.budget_tokens), summary: "auto" };
+		// Explicit operator choice wins; a numeric budget maps to a level; otherwise the model's
+		// own default (medium) — requesting "high" on every turn is what made sessions sluggish.
+		const effort =
+			opts.reasoningEffort ??
+			(typeof thinking.budget_tokens === "number" ? effortOf(thinking.budget_tokens) : "medium");
+		out.reasoning = { effort, summary: "auto" };
 		out.include = ["reasoning.encrypted_content"];
 	}
+	if (opts.serviceTier) out.service_tier = opts.serviceTier;
 	return out;
 }
 
 /** Conservative context estimate for /v1/messages/count_tokens (an over-estimate by design). */
 export function estimateTokens(body: Json): number {
-	const s = JSON.stringify({ system: body.system, messages: body.messages, tools: body.tools });
+	const s = JSON.stringify({
+		system: body.system,
+		messages: body.messages,
+		tools: body.tools,
+	});
 	return Math.ceil(s.length / 3);
 }
 
@@ -376,7 +391,10 @@ export class ResponsesToAnthropic {
 					block.args += bytes;
 					if (block.args > this.maxArgBytes) return this.fail(out, "tool call arguments too large");
 				}
-				this.delta(out, itemId, 0, { type: "input_json_delta", partial_json: chunk });
+				this.delta(out, itemId, 0, {
+					type: "input_json_delta",
+					partial_json: chunk,
+				});
 				break;
 			}
 			case "response.reasoning_summary_text.delta":
@@ -455,7 +473,11 @@ export class ResponsesToAnthropic {
 		const entry = this.entry(itemId, kind);
 		const block: OpenBlock = { index: this.nextIndex++, kind, args: 0 };
 		entry.blocks.set(contentIndex, block);
-		out.push({ type: "content_block_start", index: block.index, content_block: contentBlock });
+		out.push({
+			type: "content_block_start",
+			index: block.index,
+			content_block: contentBlock,
+		});
 		return block;
 	}
 
@@ -543,7 +565,11 @@ export class ResponsesToAnthropic {
 			const args = entry.pending.args.length
 				? entry.pending.args.join("")
 				: String(item.arguments ?? "");
-			if (args) this.delta(out, id, 0, { type: "input_json_delta", partial_json: args });
+			if (args)
+				this.delta(out, id, 0, {
+					type: "input_json_delta",
+					partial_json: args,
+				});
 			entry.pending = undefined;
 		}
 		for (const block of inContentOrder(entry.blocks)) {
@@ -641,7 +667,14 @@ export function aggregate(events: AnthropicEvent[]): Json {
 	};
 	const blocks = new Map<
 		number,
-		{ type: string; text: string; json: string; name?: string; id?: string; signature?: string }
+		{
+			type: string;
+			text: string;
+			json: string;
+			name?: string;
+			id?: string;
+			signature?: string;
+		}
 	>();
 	for (const ev of events) {
 		switch (ev.type) {
@@ -705,7 +738,11 @@ export function aggregate(events: AnthropicEvent[]): Json {
 					input: parseInput(b.name ?? "", b.json),
 				};
 			if (b.type === "thinking")
-				return { type: "thinking", thinking: b.text, signature: b.signature ?? "" };
+				return {
+					type: "thinking",
+					thinking: b.text,
+					signature: b.signature ?? "",
+				};
 			return { type: "text", text: b.text };
 		});
 	return {

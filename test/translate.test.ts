@@ -878,3 +878,36 @@ describe("review fixes: request mapping", () => {
 		expect(warnings.some((w) => w.includes("foreign or invalid signature"))).toBe(true);
 	});
 });
+
+describe("speed: reasoning effort + service tier", () => {
+	const base = {
+		model: "claude-opus-5",
+		max_tokens: 1,
+		messages: [{ role: "user", content: "x" }],
+	};
+	test("thinking without a budget → the model's default (medium), not high", () => {
+		const out = toResponsesRequest({ ...base, thinking: { type: "adaptive" } }, OPTS);
+		expect(out.reasoning?.effort).toBe("medium");
+	});
+	test("an explicit effort overrides any budget", () => {
+		const out = toResponsesRequest(
+			{ ...base, thinking: { type: "enabled", budget_tokens: 32000 } },
+			{ ...OPTS, reasoningEffort: "low" },
+		);
+		expect(out.reasoning?.effort).toBe("low");
+	});
+	test("service tier is sent only when configured", () => {
+		expect("service_tier" in toResponsesRequest(base, OPTS)).toBe(false);
+		expect(toResponsesRequest(base, { ...OPTS, serviceTier: "priority" }).service_tier).toBe(
+			"priority",
+		);
+	});
+	test("a [1m] suffix is a client hint and is stripped from the upstream model id", () => {
+		expect(toResponsesRequest({ ...base, model: "gpt-6-astra[1m]" }, OPTS).model).toBe(
+			"gpt-6-astra",
+		);
+		expect(toResponsesRequest({ ...base, model: "claude-opus-5[1m]" }, OPTS).model).toBe(
+			"gpt-6-astra",
+		);
+	});
+});

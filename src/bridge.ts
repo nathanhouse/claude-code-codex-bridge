@@ -44,6 +44,10 @@ export interface BridgeConfig {
 	maxAggregateBytes?: number;
 	/** If set, the latest usage reading is written here (JSON, numbers only) for other tools. */
 	usageFile?: string;
+	/** Reasoning effort override (low|medium|high|xhigh|max); default = model's own default via the mapper. */
+	reasoningEffort?: string;
+	/** Backend service tier; "priority" = the "Fast" tier (≈2× speed, more usage). */
+	serviceTier?: string;
 	upstreamIdleMs?: number;
 	parentPid?: number;
 	watchdogMs?: number;
@@ -123,7 +127,10 @@ async function upstreamReason(res: Response, secret: string): Promise<string> {
 	}
 	let message = "";
 	try {
-		const parsed = JSON.parse(text) as { error?: { message?: unknown }; detail?: unknown };
+		const parsed = JSON.parse(text) as {
+			error?: { message?: unknown };
+			detail?: unknown;
+		};
 		if (typeof parsed?.error?.message === "string") message = parsed.error.message;
 		else if (typeof parsed?.detail === "string") message = parsed.detail;
 	} catch {
@@ -291,6 +298,8 @@ export async function startBridge(cfg: BridgeConfig) {
 				smallModel: cfg.smallModel,
 				cacheKey,
 				warn: warnOnce,
+				reasoningEffort: cfg.reasoningEffort,
+				serviceTier: cfg.serviceTier,
 			});
 		} catch (err) {
 			if (err instanceof InvalidRequestError)
@@ -390,7 +399,10 @@ export async function startBridge(cfg: BridgeConfig) {
 			for await (const ev of stream) yield sse(ev);
 		})() as unknown as BodyInit;
 		return new Response(sseBody, {
-			headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
+			headers: {
+				"Content-Type": "text/event-stream",
+				"Cache-Control": "no-cache",
+			},
 		});
 	}
 
@@ -419,7 +431,9 @@ export async function startBridge(cfg: BridgeConfig) {
 			}
 			if (req.method === "POST" && url.pathname === "/v1/messages/count_tokens") {
 				try {
-					return Response.json({ input_tokens: estimateTokens(await req.json()) });
+					return Response.json({
+						input_tokens: estimateTokens(await req.json()),
+					});
 				} catch {
 					return anthropicError(400, "invalid_request_error", "body is not valid JSON");
 				}
@@ -480,6 +494,8 @@ if (import.meta.main) {
 		maxBodyBytes: 32 * 1024 * 1024,
 		maxLineBytes: 1024 * 1024,
 		usageFile: env.CCB_USAGE_FILE || undefined,
+		reasoningEffort: env.CCB_REASONING || undefined,
+		serviceTier: env.CCB_SERVICE_TIER === "" ? undefined : (env.CCB_SERVICE_TIER ?? "priority"),
 		parentPid: env.CCB_PARENT_PID ? Number(env.CCB_PARENT_PID) : undefined,
 		watchdogMs: env.CCB_WATCHDOG_MS ? Number(env.CCB_WATCHDOG_MS) : undefined,
 	});

@@ -305,6 +305,13 @@ export interface MapperOptions {
 	maxArgBytes?: number;
 	/** Sink for conditions that don't stop the stream but the operator should know about. */
 	warn?: (msg: string) => void;
+	/**
+	 * Surface the model's reasoning as Anthropic `thinking` blocks (signature = our envelope).
+	 * Off by default: Anthropic verifies thinking signatures, so a transcript that carries ours
+	 * would be rejected if the session is later resumed on a real Claude model. Codex does not
+	 * need the reasoning replayed (verified live), so nothing is lost by hiding it.
+	 */
+	emitThinking?: boolean;
 }
 
 function usageOf(u: unknown): Json {
@@ -331,9 +338,12 @@ export class ResponsesToAnthropic {
 	private readonly maxArgBytes: number;
 	private readonly warn: (msg: string) => void;
 
+	private readonly emitThinking: boolean;
+
 	constructor(opts: MapperOptions = {}) {
 		this.maxArgBytes = opts.maxArgBytes ?? 4 * 1024 * 1024;
 		this.warn = opts.warn ?? (() => undefined);
+		this.emitThinking = opts.emitThinking ?? false;
 	}
 
 	get done(): boolean {
@@ -398,10 +408,11 @@ export class ResponsesToAnthropic {
 				break;
 			}
 			case "response.reasoning_summary_text.delta":
-				this.delta(out, String(ev.item_id ?? ""), 0, {
-					type: "thinking_delta",
-					thinking: String(ev.delta ?? ""),
-				});
+				if (this.emitThinking)
+					this.delta(out, String(ev.item_id ?? ""), 0, {
+						type: "thinking_delta",
+						thinking: String(ev.delta ?? ""),
+					});
 				break;
 			case "response.output_item.done":
 				this.itemDone(out, ev.item as Json);
@@ -521,7 +532,9 @@ export class ResponsesToAnthropic {
 			// so hold the block (and its argument deltas) until we know it.
 			else this.entry(id, type).pending = { callId, args: [], bytes: 0 };
 		} else if (type === "reasoning") {
-			if (!this.items.get(id)?.blocks.has(0))
+			if (!this.emitThinking)
+				this.entry(id, type); // known item, no block — deltas are skipped
+			else if (!this.items.get(id)?.blocks.has(0))
 				this.open(out, id, 0, "thinking", { type: "thinking", thinking: "" });
 		} else {
 			this.entry(id, type);

@@ -48,6 +48,8 @@ export interface BridgeConfig {
 	reasoningEffort?: string;
 	/** Backend service tier; "priority" = the "Fast" tier (≈2× speed, more usage). */
 	serviceTier?: string;
+	/** Show the model's reasoning as thinking blocks (default off — keeps transcripts resumable on Claude). */
+	emitThinking?: boolean;
 	upstreamIdleMs?: number;
 	parentPid?: number;
 	watchdogMs?: number;
@@ -218,7 +220,7 @@ export async function startBridge(cfg: BridgeConfig) {
 		res: Response,
 		abort: AbortController,
 	): AsyncGenerator<AnthropicEvent> {
-		const mapper = new ResponsesToAnthropic({ warn: warnOnce });
+		const mapper = new ResponsesToAnthropic({ warn: warnOnce, emitThinking: cfg.emitThinking });
 		const decoder = new SseDecoder({ maxLineBytes: cfg.maxLineBytes });
 		const reader = res.body?.getReader();
 		if (!reader) {
@@ -495,6 +497,7 @@ if (import.meta.main) {
 		maxLineBytes: 1024 * 1024,
 		usageFile: env.CCB_USAGE_FILE || undefined,
 		reasoningEffort: env.CCB_REASONING || undefined,
+		emitThinking: env.CCB_THINKING === "1",
 		// Off by default: measured 2026-09-11, the backend echoes "default" and runs no faster with
 		// service_tier:"priority" from this client — and if it ever starts applying, it costs ~2×.
 		serviceTier: env.CCB_SERVICE_TIER || undefined,

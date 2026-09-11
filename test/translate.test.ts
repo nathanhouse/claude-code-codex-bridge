@@ -253,7 +253,7 @@ const completed = (usage: unknown) => ({
 const USAGE = { input_tokens: 100, input_tokens_details: { cached_tokens: 60 }, output_tokens: 2 };
 
 function run(events: unknown[], eof = true) {
-	const m = new ResponsesToAnthropic();
+	const m = new ResponsesToAnthropic({ emitThinking: true }); // tests exercise the full mapping
 	const out = [];
 	for (const e of events) out.push(...m.push(e));
 	if (eof) out.push(...m.finish());
@@ -909,5 +909,50 @@ describe("speed: reasoning effort + service tier", () => {
 		expect(toResponsesRequest({ ...base, model: "claude-opus-5[1m]" }, OPTS).model).toBe(
 			"gpt-6-astra",
 		);
+	});
+});
+
+describe("thinking off by default (resumable transcripts)", () => {
+	test("reasoning items produce no thinking blocks and no orphan-delta count", () => {
+		const m = new ResponsesToAnthropic();
+		const out = [
+			...m.push(created),
+			...m.push({
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { id: "rs_1", type: "reasoning", summary: [] },
+			}),
+			...m.push({
+				type: "response.reasoning_summary_text.delta",
+				item_id: "rs_1",
+				output_index: 0,
+				summary_index: 0,
+				delta: "think",
+			}),
+			...m.push({
+				type: "response.output_item.done",
+				output_index: 0,
+				item: {
+					id: "rs_1",
+					type: "reasoning",
+					summary: [{ type: "summary_text", text: "think" }],
+					encrypted_content: "ENC",
+				},
+			}),
+			...m.push(msgAdded),
+			...m.push(partText),
+			...m.push(delta("ok")),
+			...m.push(msgDone),
+			...m.push(completed(USAGE)),
+		];
+		expect(
+			out.some(
+				(e) =>
+					e.type === "content_block_start" &&
+					(e.content_block as { type: string }).type === "thinking",
+			),
+		).toBe(false);
+		expect(m.dropped).toBe(0);
+		expect(aggregate(out).content).toEqual([{ type: "text", text: "ok" }]);
 	});
 });

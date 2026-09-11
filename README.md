@@ -71,6 +71,8 @@ keeps the latest reading:
 - `bun run src/usage.ts` (or `--json`) checks without starting a session — it costs one minimal
   completion (a few tokens), because only real completions carry the headers.
 - `GET http://127.0.0.1:PORT/usage` (with the session token) while the bridge is running.
+- Set `CCB_USAGE_FILE=/path/to/usage.json` and the bridge writes the latest reading there
+  (atomically, numbers only, mode 0600) so a dashboard can show it without spending anything.
 
 When the limit is hit the backend answers 429; the bridge passes on `retry-after` and the reset time.
 

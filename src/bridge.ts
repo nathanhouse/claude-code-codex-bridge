@@ -14,7 +14,13 @@ import {
 	toResponsesRequest,
 	UpstreamError,
 } from "./translate";
-import { type CodexUsage, formatUsage, parseCodexUsage, usageThreshold } from "./usage";
+import {
+	type CodexUsage,
+	formatUsage,
+	parseCodexUsage,
+	usageThreshold,
+	writeSnapshot,
+} from "./usage";
 
 export const VERSION = "0.1.0";
 
@@ -36,6 +42,8 @@ export interface BridgeConfig {
 	maxLineBytes: number;
 	/** Cap on a non-streaming (stream:false) reply assembled in memory. */
 	maxAggregateBytes?: number;
+	/** If set, the latest usage reading is written here (JSON, numbers only) for other tools. */
+	usageFile?: string;
 	upstreamIdleMs?: number;
 	parentPid?: number;
 	watchdogMs?: number;
@@ -162,6 +170,15 @@ export async function startBridge(cfg: BridgeConfig) {
 		const usage = parseCodexUsage(headers);
 		if (!usage) return;
 		lastUsage = usage;
+		if (cfg.usageFile) {
+			try {
+				writeSnapshot(cfg.usageFile, usage);
+			} catch (err) {
+				warnOnce(
+					`could not write usage snapshot ${cfg.usageFile} (${(err as { code?: string }).code ?? "error"})`,
+				);
+			}
+		}
 		const threshold = usageThreshold(usage);
 		if (threshold && !warnedAt.has(threshold)) {
 			warnedAt.add(threshold);
@@ -462,6 +479,7 @@ if (import.meta.main) {
 		log: (line) => console.error(`[ccb] ${line}`),
 		maxBodyBytes: 32 * 1024 * 1024,
 		maxLineBytes: 1024 * 1024,
+		usageFile: env.CCB_USAGE_FILE || undefined,
 		parentPid: env.CCB_PARENT_PID ? Number(env.CCB_PARENT_PID) : undefined,
 		watchdogMs: env.CCB_WATCHDOG_MS ? Number(env.CCB_WATCHDOG_MS) : undefined,
 	});

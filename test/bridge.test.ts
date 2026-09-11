@@ -401,3 +401,40 @@ describe("usage tracking", () => {
 		mode = "ok";
 	});
 });
+
+describe("usage snapshot file", () => {
+	test("CCB_USAGE_FILE gets the latest reading after each reply (atomic, 0600)", async () => {
+		mode = "ok";
+		const dir = mkdtempSync(join(tmpdir(), "ccb-snap-"));
+		const file = join(dir, "nested", "codex-usage.json");
+		const b = await startBridge({
+			host: "127.0.0.1",
+			port: 0,
+			localToken: LOCAL,
+			upstream: `http://127.0.0.1:${upstream.port}/backend-api/codex`,
+			codexHome,
+			model: "m",
+			smallModel: "m",
+			debug: false,
+			log: () => undefined,
+			maxBodyBytes: 1024 * 1024,
+			maxLineBytes: 1024 * 1024,
+			usageFile: file,
+		});
+		await fetch(`http://127.0.0.1:${b.port}/v1/messages`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Authorization: `Bearer ${LOCAL}` },
+			body: JSON.stringify(BODY),
+		});
+		const snap = (await Bun.file(file).json()) as {
+			plan: string;
+			primary: { usedPercent: number };
+			observedAt: number;
+		};
+		expect(snap.plan).toBe("pro");
+		expect(snap.primary.usedPercent).toBe(3);
+		expect(typeof snap.observedAt).toBe("number");
+		expect(JSON.stringify(snap)).not.toContain(ACCESS);
+		b.stop();
+	});
+});

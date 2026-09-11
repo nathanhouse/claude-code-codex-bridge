@@ -1,8 +1,8 @@
 // HAL-ID: #HAL-20260911-2128-NH-US
 // Description: Subscription usage as reported by the Codex backend's x-codex-* response headers — parse, format, and a minimal-cost CLI check.
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 export interface UsageWindow {
 	usedPercent: number;
@@ -78,6 +78,17 @@ export function formatUsage(u: CodexUsage): string {
 	return `ChatGPT ${u.plan} usage: ${parts.join(" · ")}`;
 }
 
+/**
+ * Persist the latest reading for other tools (e.g. an account dashboard) — atomic write,
+ * so a reader never sees a half-written file. Contains no token, only the numbers above.
+ */
+export function writeSnapshot(path: string, usage: CodexUsage): void {
+	mkdirSync(dirname(path), { recursive: true });
+	const tmp = `${path}.${process.pid}.tmp`;
+	writeFileSync(tmp, JSON.stringify(usage), { mode: 0o600 });
+	renameSync(tmp, path);
+}
+
 /** The threshold a usage reading has crossed (for a one-time warning), or null. */
 export function usageThreshold(u: CodexUsage): 80 | 95 | null {
 	const worst = Math.max(u.primary.usedPercent, u.secondary?.usedPercent ?? 0);
@@ -130,6 +141,7 @@ if (import.meta.main) {
 		console.error(`no usage headers in the response (HTTP ${res.status})${hint}`);
 		process.exit(2);
 	}
+	if (process.env.CCB_USAGE_FILE) writeSnapshot(process.env.CCB_USAGE_FILE, usage);
 	if (process.argv.includes("--json")) console.log(JSON.stringify(usage, null, 2));
 	else console.log(formatUsage(usage));
 }

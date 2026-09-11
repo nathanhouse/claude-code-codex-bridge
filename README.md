@@ -55,7 +55,7 @@ bridge is bound at launch; start a new session to go back.
 |---|---|---|
 | `CCB_MODEL` | `gpt-6-astra` | model for Opus/Sonnet-class requests |
 | `CCB_SMALL_MODEL` | `gpt-5.6-luna` | model for Haiku-class requests (titles, summaries, subagents) — the cheap tier, to protect the Astra window |
-| `CCB_SERVICE_TIER` | `priority` | the backend's **Fast** tier (≈2× speed, more usage per token). Set to empty (`CCB_SERVICE_TIER= cc-astra`) for standard speed at standard cost |
+| `CCB_SERVICE_TIER` | unset | sent as `service_tier`. The backend lists a "Fast" tier (`priority`, ≈2× speed, more usage) but in testing it echoed `default` and ran no faster from this client — so it's off unless you set it |
 | `CCB_REASONING` | model default (`medium` for Astra) | reasoning effort: `low` · `medium` · `high` · `xhigh` · `max`. Lower = faster and cheaper; Claude Code's own budget hints are honoured when this is unset |
 | `CCB_CONTEXT_TOKENS` | `872000` | the context window Claude Code should assume (it guesses 200K for unknown ids; the backend lists 272K default / 872K max and accepted 855K tokens in a live probe). Lower it for earlier compaction — the whole context is resent every turn, against your quota |
 | `CODEX_HOME` | `~/.codex` | where Codex CLI keeps `auth.json` |

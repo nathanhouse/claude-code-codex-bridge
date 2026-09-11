@@ -495,7 +495,9 @@ if (import.meta.main) {
 		maxLineBytes: 1024 * 1024,
 		usageFile: env.CCB_USAGE_FILE || undefined,
 		reasoningEffort: env.CCB_REASONING || undefined,
-		serviceTier: env.CCB_SERVICE_TIER === "" ? undefined : (env.CCB_SERVICE_TIER ?? "priority"),
+		// Off by default: measured 2026-09-11, the backend echoes "default" and runs no faster with
+		// service_tier:"priority" from this client — and if it ever starts applying, it costs ~2×.
+		serviceTier: env.CCB_SERVICE_TIER || undefined,
 		parentPid: env.CCB_PARENT_PID ? Number(env.CCB_PARENT_PID) : undefined,
 		watchdogMs: env.CCB_WATCHDOG_MS ? Number(env.CCB_WATCHDOG_MS) : undefined,
 	});

@@ -59,8 +59,12 @@ bridge is bound at launch; start a new session to go back.
 | `CODEX_HOME` | `~/.codex` | where Codex CLI keeps `auth.json` |
 | `CCB_DEBUG` | unset | `1` logs upstream event types to stderr (never bodies) |
 
-Two harmless warnings appear on launch — "not a model this version of Claude Code recognizes" and
-"claude.ai connectors are disabled". Ignore them.
+Three harmless notices to expect from Claude Code: "not a model this version of Claude Code
+recognizes" and "claude.ai connectors are disabled" on launch, and on exit "gpt-6-astra isn't
+described by this version's model catalog… auto-compact keeps this session within…". The first two
+are cosmetic. The third is Claude Code saying it had to *assume* a context window — the launcher
+sets `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the real one (272K), which is the remedy the notice asks
+for; it keeps printing the catalog part regardless.
 
 ## Usage and limits
 

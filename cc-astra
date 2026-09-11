@@ -101,6 +101,7 @@ fi
 claude "$@"
 RC=$?
 # What the session cost against the subscription (the backend reports it on every reply).
-USAGE="$(curl -s --max-time 2 -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/usage?format=text")"
-[ -n "$USAGE" ] && printf 'cc-astra: %s\n' "$USAGE" >&2
+# A session that made no completed call has nothing to report — stay quiet rather than print the 404 body.
+USAGE="$(curl -sf --max-time 2 -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/usage?format=text" 2>/dev/null)"
+case "$USAGE" in ChatGPT*) printf 'cc-astra: %s\n' "$USAGE" >&2 ;; esac
 exit "$RC"

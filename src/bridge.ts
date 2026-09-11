@@ -420,8 +420,9 @@ export async function startBridge(cfg: BridgeConfig) {
 				return anthropicError(401, "authentication_error", "missing or invalid local bridge token");
 			}
 			if (req.method === "GET" && url.pathname === "/usage") {
-				if (!lastUsage)
-					return anthropicError(404, "not_found_error", "no usage observed yet in this session");
+				// 204: a session that made no completed call has nothing to report. Not an error —
+				// a launcher asking on exit must be able to stay silent without parsing a body.
+				if (!lastUsage) return new Response(null, { status: 204 });
 				const wantText =
 					url.searchParams.get("format") === "text" ||
 					(req.headers.get("accept") ?? "").includes("text/plain");

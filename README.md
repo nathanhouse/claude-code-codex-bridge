@@ -51,8 +51,10 @@ CCB_MODEL=gpt-5.6-terra cc-astra
 Your normal `claude` command is untouched and still uses Anthropic. One provider per session: the
 bridge is bound at launch; start a new session to go back.
 
-**Resuming across models works both ways** — `cc-astra --resume` / `cc-astra -c` picks up a
-Claude session on Astra, and `claude --resume` picks up an Astra session on Claude. Claude's own
+**Resume Astra sessions with `cc-astra`, not `claude`.** A session records the model it ran on, so
+`claude --resume` on an Astra session asks Anthropic for `gpt-6-astra` and fails with *"There's an
+issue with the selected model"*. `cc-astra --resume` (picker), `cc-astra --resume <session-id>`, or
+`cc-astra -c` all work. Going the other way — picking up a **Claude** session on Astra — is fine. Claude's own
 thinking blocks are dropped when replayed to Astra (their signatures aren't ours). To keep the
 reverse direction safe, the bridge does **not** emit thinking blocks by default — Anthropic verifies
 thinking signatures and would reject the bridge's on resume. `CCB_THINKING=1` shows Astra's reasoning

@@ -438,3 +438,27 @@ describe("usage snapshot file", () => {
 		b.stop();
 	});
 });
+
+describe("quiet exit when nothing was spent", () => {
+	test("/usage before any completed call → 204 with no body (launchers stay silent)", async () => {
+		const fresh = await startBridge({
+			host: "127.0.0.1",
+			port: 0,
+			localToken: LOCAL,
+			upstream: `http://127.0.0.1:${upstream.port}/backend-api/codex`,
+			codexHome,
+			model: "m",
+			smallModel: "m",
+			debug: false,
+			log: () => undefined,
+			maxBodyBytes: 1024 * 1024,
+			maxLineBytes: 1024 * 1024,
+		});
+		const r = await fetch(`http://127.0.0.1:${fresh.port}/usage?format=text`, {
+			headers: { Authorization: `Bearer ${LOCAL}` },
+		});
+		expect(r.status).toBe(204);
+		expect(await r.text()).toBe("");
+		fresh.stop();
+	});
+});

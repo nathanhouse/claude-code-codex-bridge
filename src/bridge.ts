@@ -14,6 +14,7 @@ import {
 	toResponsesRequest,
 	UpstreamError,
 } from "./translate";
+import { type CodexUsage, formatUsage, parseCodexUsage, usageThreshold } from "./usage";
 
 export const VERSION = "0.1.0";
 
@@ -154,6 +155,20 @@ export async function startBridge(cfg: BridgeConfig) {
 	};
 	warnIfLoosePermissions(cfg.codexHome, cfg.log);
 
+	// The backend reports subscription usage on every reply; keep the latest and warn once per threshold.
+	let lastUsage: CodexUsage | null = null;
+	const warnedAt = new Set<number>();
+	const recordUsage = (headers: Headers) => {
+		const usage = parseCodexUsage(headers);
+		if (!usage) return;
+		lastUsage = usage;
+		const threshold = usageThreshold(usage);
+		if (threshold && !warnedAt.has(threshold)) {
+			warnedAt.add(threshold);
+			cfg.log(`warning: ${formatUsage(usage)}`);
+		}
+	};
+
 	async function callUpstream(
 		body: unknown,
 		auth: CodexAuth,
@@ -273,7 +288,9 @@ export async function startBridge(cfg: BridgeConfig) {
 		const abort = new AbortController();
 		const reach = async (): Promise<Response> => {
 			try {
-				return await callUpstream(upstreamBody, auth, abort.signal);
+				const r = await callUpstream(upstreamBody, auth, abort.signal);
+				recordUsage(r.headers);
+				return r;
 			} catch (err) {
 				// fetch itself failed: no network, DNS, TLS interception, backend down. Carries no token or body.
 				const code =
@@ -315,10 +332,11 @@ export async function startBridge(cfg: BridgeConfig) {
 			const reason = await upstreamReason(res, auth.accessToken);
 			const suffix = reason ? `: ${reason}` : "";
 			if (res.status === 429) {
+				const when = lastUsage ? ` — ${formatUsage(lastUsage)}` : "";
 				const r = anthropicError(
 					429,
 					"rate_limit_error",
-					`ChatGPT subscription rate limit reached${suffix}`,
+					`ChatGPT subscription rate limit reached${suffix}${when}`,
 				);
 				const retry = res.headers.get("retry-after");
 				if (retry) r.headers.set("retry-after", retry);
@@ -369,6 +387,18 @@ export async function startBridge(cfg: BridgeConfig) {
 				return Response.json({ ok: true, version: VERSION });
 			if (!tokenMatches(req.headers.get("authorization"), cfg.localToken)) {
 				return anthropicError(401, "authentication_error", "missing or invalid local bridge token");
+			}
+			if (req.method === "GET" && url.pathname === "/usage") {
+				if (!lastUsage)
+					return anthropicError(404, "not_found_error", "no usage observed yet in this session");
+				const wantText =
+					url.searchParams.get("format") === "text" ||
+					(req.headers.get("accept") ?? "").includes("text/plain");
+				if (wantText)
+					return new Response(formatUsage(lastUsage), {
+						headers: { "Content-Type": "text/plain" },
+					});
+				return Response.json(lastUsage);
 			}
 			if (req.method === "POST" && url.pathname === "/v1/messages/count_tokens") {
 				try {
@@ -427,7 +457,7 @@ if (import.meta.main) {
 		upstream: env.CCB_UPSTREAM ?? DEFAULT_UPSTREAM,
 		codexHome: env.CODEX_HOME ?? join(homedir(), ".codex"),
 		model: env.CCB_MODEL ?? "gpt-6-astra",
-		smallModel: env.CCB_SMALL_MODEL ?? env.CCB_MODEL ?? "gpt-6-astra",
+		smallModel: env.CCB_SMALL_MODEL ?? "gpt-5.6-luna",
 		debug: env.CCB_DEBUG === "1",
 		log: (line) => console.error(`[ccb] ${line}`),
 		maxBodyBytes: 32 * 1024 * 1024,

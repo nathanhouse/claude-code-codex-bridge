@@ -4,14 +4,14 @@
 # Command: #HAL-20260910-2116-NH-SI  (read it FIRST — resolve: rg -l 'HAL-20260910-2116-NH-SI' ~/.claude/commands/)
 #
 # Usage:  cc-astra [claude args...]        e.g.  cc-astra -p "reply pong"
-# Env:    CCB_MODEL (default gpt-6-astra)  CCB_SMALL_MODEL (default = CCB_MODEL)  CCB_DEBUG=1  CODEX_HOME
+# Env:    CCB_MODEL (default gpt-6-astra)  CCB_SMALL_MODEL (default gpt-5.6-luna)  CCB_DEBUG=1  CODEX_HOME
 #         CCB_DRY_RUN=1 prints the environment claude would get and exits (used by selftest.sh)
 # Exit:   claude's exit code; 2 = prerequisites missing; 3 = bridge failed to start
 set -u
 
 DIR="$(cd "$(dirname "$(readlink "$0" 2>/dev/null || echo "$0")")" && pwd)"
 CCB_MODEL="${CCB_MODEL:-gpt-6-astra}"
-CCB_SMALL_MODEL="${CCB_SMALL_MODEL:-$CCB_MODEL}"
+CCB_SMALL_MODEL="${CCB_SMALL_MODEL:-gpt-5.6-luna}" # Haiku-class calls (titles, summaries, subagents) go to the cheap tier
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 
 die() { printf 'cc-astra: %s\n' "$*" >&2; exit "${2:-2}"; }
@@ -27,6 +27,7 @@ TOKEN="$(LC_ALL=C tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 48)"
 OUT="$(mktemp)"; ERR="$(mktemp)"
 BRIDGE_PID=""
 ERR_SHOWN=0
+# shellcheck disable=SC2329  # invoked via trap
 cleanup() {
 	if [ -n "$BRIDGE_PID" ]; then
 		if kill -0 "$BRIDGE_PID" 2>/dev/null; then
@@ -94,3 +95,8 @@ if [ "${CCB_DRY_RUN:-0}" = "1" ]; then
 fi
 
 claude "$@"
+RC=$?
+# What the session cost against the subscription (the backend reports it on every reply).
+USAGE="$(curl -s --max-time 2 -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/usage?format=text")"
+[ -n "$USAGE" ] && printf 'cc-astra: %s\n' "$USAGE" >&2
+exit "$RC"

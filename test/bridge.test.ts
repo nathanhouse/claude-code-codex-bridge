@@ -19,7 +19,7 @@ const T3_SSE = [
 	'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":60},"output_tokens":2}}}\n\n',
 ].join("");
 
-type Mode = "ok" | "401" | "huge" | "400msg" | "429";
+type Mode = "ok" | "401" | "huge" | "400msg" | "429" | "usage85";
 let mode: Mode = "ok";
 let lastHeaders: Record<string, string> = {};
 let lastBody: Record<string, unknown> = {};
@@ -45,7 +45,16 @@ const upstream = Bun.serve({
 			return new Response(`data: ${"x".repeat(5 * 1024 * 1024)}\n\n`, {
 				headers: { "Content-Type": "text/event-stream" },
 			});
-		return new Response(T3_SSE, { headers: { "Content-Type": "text/event-stream" } });
+		return new Response(T3_SSE, {
+			headers: {
+				"Content-Type": "text/event-stream",
+				"x-codex-plan-type": "pro",
+				"x-codex-primary-used-percent": mode === "usage85" ? "85" : "3",
+				"x-codex-primary-window-minutes": "10080",
+				"x-codex-primary-reset-after-seconds": "300000",
+				"x-codex-secondary-window-minutes": "0",
+			},
+		});
 	},
 });
 
@@ -358,5 +367,37 @@ describe("review fixes: what the user is told", () => {
 		expect(r.status).toBe(502);
 		expect(((await r.json()) as { error: { message: string } }).error.message).toContain("exceeds");
 		small.stop();
+	});
+});
+
+describe("usage tracking", () => {
+	test("/usage needs the local token; after a request it reports what the backend said (JSON and text)", async () => {
+		mode = "ok";
+		expect((await fetch(url("/usage"))).status).toBe(401);
+		await post("/v1/messages", BODY, { Authorization: `Bearer ${LOCAL}` });
+		const j = (await (
+			await fetch(url("/usage"), { headers: { Authorization: `Bearer ${LOCAL}` } })
+		).json()) as {
+			plan: string;
+			primary: { usedPercent: number; windowMinutes: number };
+			secondary: unknown;
+		};
+		expect(j.plan).toBe("pro");
+		expect(j.primary.usedPercent).toBe(3);
+		expect(j.primary.windowMinutes).toBe(10080);
+		expect(j.secondary).toBeNull();
+		const t = await (
+			await fetch(url("/usage?format=text"), { headers: { Authorization: `Bearer ${LOCAL}` } })
+		).text();
+		expect(t).toContain("3% of the 1-week window");
+	});
+	test("crossing 80% logs one warning with the usage line", async () => {
+		mode = "usage85";
+		const before = stderr.length;
+		await post("/v1/messages", BODY, { Authorization: `Bearer ${LOCAL}` });
+		await post("/v1/messages", BODY, { Authorization: `Bearer ${LOCAL}` });
+		const warnings = stderr.slice(before).filter((l) => l.includes("85% of the 1-week window"));
+		expect(warnings.length).toBe(1);
+		mode = "ok";
 	});
 });

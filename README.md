@@ -54,12 +54,25 @@ bridge is bound at launch; start a new session to go back.
 | Env | Default | Meaning |
 |---|---|---|
 | `CCB_MODEL` | `gpt-6-astra` | model for Opus/Sonnet-class requests |
-| `CCB_SMALL_MODEL` | `= CCB_MODEL` | model for Haiku-class requests (titles, summaries, subagents) — set a cheaper one to save quota |
+| `CCB_SMALL_MODEL` | `gpt-5.6-luna` | model for Haiku-class requests (titles, summaries, subagents) — the cheap tier, to protect the Astra window |
 | `CODEX_HOME` | `~/.codex` | where Codex CLI keeps `auth.json` |
 | `CCB_DEBUG` | unset | `1` logs upstream event types to stderr (never bodies) |
 
 Two harmless warnings appear on launch — "not a model this version of Claude Code recognizes" and
 "claude.ai connectors are disabled". Ignore them.
+
+## Usage and limits
+
+The backend reports your subscription usage on every reply (`x-codex-*` headers). The bridge
+keeps the latest reading:
+
+- `cc-astra` prints one line when the session ends — e.g. `ChatGPT pro usage: 7% of the 1-week window (resets in 4d 3h)`.
+- It warns on stderr the first time you cross **80%** and **95%**.
+- `bun run src/usage.ts` (or `--json`) checks without starting a session — it costs one minimal
+  completion (a few tokens), because only real completions carry the headers.
+- `GET http://127.0.0.1:PORT/usage` (with the session token) while the bridge is running.
+
+When the limit is hit the backend answers 429; the bridge passes on `retry-after` and the reset time.
 
 ## Verify it
 

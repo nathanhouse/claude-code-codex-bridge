@@ -84,8 +84,10 @@ export ANTHROPIC_DEFAULT_OPUS_MODEL="$CCB_MODEL"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="$CCB_MODEL"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="$CCB_SMALL_MODEL"
 export CLAUDE_CODE_SUBAGENT_MODEL="$CCB_MODEL"
-# Claude Code assumes 200K for a model id it doesn't know; the Codex backend lists these models at 272K.
-export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CCB_CONTEXT_TOKENS:-272000}"
+# Claude Code assumes 200K for an unknown model id. The Codex backend lists 272K as the default and 872K as
+# the maximum; a live probe (2026-09-11) accepted 855K input tokens, so the maximum is the real window.
+# Lower it via CCB_CONTEXT_TOKENS for earlier compaction — the whole context is resent every turn, against quota.
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CCB_CONTEXT_TOKENS:-872000}"
 export DISABLE_TELEMETRY=1
 
 printf 'cc-astra: bridge 127.0.0.1:%s → %s (ChatGPT subscription via Codex login)\n' "$PORT" "$CCB_MODEL" >&2

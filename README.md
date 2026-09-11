@@ -55,6 +55,7 @@ bridge is bound at launch; start a new session to go back.
 |---|---|---|
 | `CCB_MODEL` | `gpt-6-astra` | model for Opus/Sonnet-class requests |
 | `CCB_SMALL_MODEL` | `gpt-5.6-luna` | model for Haiku-class requests (titles, summaries, subagents) — the cheap tier, to protect the Astra window |
+| `CCB_CONTEXT_TOKENS` | `272000` | the context window Claude Code should assume (it guesses 200K for unknown model ids; the Codex backend lists these models at 272K) |
 | `CODEX_HOME` | `~/.codex` | where Codex CLI keeps `auth.json` |
 | `CCB_DEBUG` | unset | `1` logs upstream event types to stderr (never bodies) |
 

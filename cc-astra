@@ -84,12 +84,14 @@ export ANTHROPIC_DEFAULT_OPUS_MODEL="$CCB_MODEL"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="$CCB_MODEL"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="$CCB_SMALL_MODEL"
 export CLAUDE_CODE_SUBAGENT_MODEL="$CCB_MODEL"
+# Claude Code assumes 200K for a model id it doesn't know; the Codex backend lists these models at 272K.
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CCB_CONTEXT_TOKENS:-272000}"
 export DISABLE_TELEMETRY=1
 
 printf 'cc-astra: bridge 127.0.0.1:%s → %s (ChatGPT subscription via Codex login)\n' "$PORT" "$CCB_MODEL" >&2
 
 if [ "${CCB_DRY_RUN:-0}" = "1" ]; then
-	env | grep -E '^(ANTHROPIC_|CLAUDE_CODE_SUBAGENT_MODEL|DISABLE_TELEMETRY)' | sed "s/$TOKEN/<token>/"
+	env | grep -E '^(ANTHROPIC_|CLAUDE_CODE_SUBAGENT_MODEL|CLAUDE_CODE_MAX_CONTEXT_TOKENS|DISABLE_TELEMETRY)' | sed "s/$TOKEN/<token>/"
 	printf 'CCB_BRIDGE_PID=%s\n' "$BRIDGE_PID"
 	exit 0
 fi
